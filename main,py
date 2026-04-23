@@ -1,0 +1,107 @@
+import os
+import uuid
+import smtplib
+import logging
+from email.mime.text import MIMEText
+from flask import Flask, request, jsonify, redirect
+import requests
+
+app = Flask(__name__)
+logging.basicConfig(level=logging.INFO)
+
+BOT_TOKEN          = os.environ.get("BOT_TOKEN")
+GROUP_ID           = os.environ.get("GROUP_ID")
+SMTP_EMAIL         = os.environ.get("SMTP_EMAIL")
+SMTP_PASSWORD      = os.environ.get("SMTP_PASSWORD")
+SMTP_HOST          = os.environ.get("SMTP_HOST", "smtp.gmail.com")
+SMTP_PORT          = int(os.environ.get("SMTP_PORT", "587"))
+INFINITEPAY_HANDLE = os.environ.get("INFINITEPAY_HANDLE")
+BASE_URL           = os.environ.get("BASE_URL")
+PRODUTO_NOME       = os.environ.get("PRODUTO_NOME", "Acesso Grupo VIP")
+PRODUTO_PRECO      = int(os.environ.get("PRODUTO_PRECO", "9700"))
+
+
+@app.route("/comprar", methods=["GET"])
+def comprar():
+    order_nsu = str(uuid.uuid4())[:8]
+    payload = {
+        "handle": INFINITEPAY_HANDLE,
+        "redirect_url": f"{BASE_URL}/obrigado",
+        "webhook_url": f"{BASE_URL}/webhook",
+        "order_nsu": order_nsu,
+        "items": [{"quantity": 1, "price": PRODUTO_PRECO, "description": PRODUTO_NOME}]
+    }
+    r = requests.post("https://api.infinitepay.io/invoices/public/checkout/links", json=payload)
+    data = r.json()
+    logging.info(f"Link gerado: {data}")
+    link = data.get("checkout_url") or data.get("url") or data.get("link")
+    if link:
+        return redirect(link)
+    return jsonify({"error": "Falha ao gerar link", "detalhe": data}), 500
+
+
+@app.route("/webhook", methods=["POST"])
+def webhook():
+    data = request.get_json(silent=True)
+    if not data:
+        return jsonify({"error": "sem dados"}), 400
+    logging.info(f"Webhook recebido: {data}")
+    customer = data.get("customer", {})
+    nome     = customer.get("name", "Cliente")
+    email    = customer.get("email")
+    pago     = data.get("paid", False)
+    if not pago:
+        return jsonify({"status": "aguardando pagamento"}), 200
+    if not email:
+        return jsonify({"error": "email nao encontrado"}), 400
+    link = gerar_link_convite()
+    if not link:
+        return jsonify({"error": "falha ao gerar link Telegram"}), 500
+    enviar_email(email, nome, link)
+    return jsonify({"status": "ok"}), 200
+
+
+@app.route("/obrigado")
+def obrigado():
+    return """<html><body style="font-family:sans-serif;text-align:center;padding:60px">
+    <h1>Pagamento confirmado!</h1>
+    <p>Verifique seu e-mail — o link de acesso ao grupo foi enviado.</p>
+    </body></html>"""
+
+
+def gerar_link_convite():
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/createChatInviteLink"
+    r = requests.post(url, json={"chat_id": GROUP_ID, "member_limit": 1})
+    data = r.json()
+    if data.get("ok"):
+        return data["result"]["invite_link"]
+    logging.error(f"Erro Telegram: {data}")
+    return None
+
+
+def enviar_email(destinatario, nome, link):
+    corpo = f"Olá, {nome}!\n\nSeu pagamento foi confirmado. Acesse o grupo:\n\n{link}\n\n⚠️ Link único. Não compartilhe."
+    msg = MIMEText(corpo, "plain", "utf-8")
+    msg["Subject"] = "✅ Seu acesso ao grupo foi liberado!"
+    msg["From"]    = SMTP_EMAIL
+    msg["To"]      = destinatario
+    try:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as s:
+            s.starttls()
+            s.login(SMTP_EMAIL, SMTP_PASSWORD)
+            s.sendmail(SMTP_EMAIL, destinatario, msg.as_string())
+        logging.info(f"E-mail enviado → {destinatario}")
+        return True
+    except Exception as e:
+        logging.error(f"Erro e-mail: {e}")
+        return False
+
+
+@app.route("/", methods=["GET"])
+def health():
+    return jsonify({"status": "online"}), 200
+
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
